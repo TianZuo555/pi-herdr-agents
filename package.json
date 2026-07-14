@@ -1,0 +1,33 @@
+{
+	"name": "pi-herdr-agents",
+	"version": "0.1.0",
+	"description": "Pi extension that delegates tasks to independent coding-agent processes in Herdr panes",
+	"type": "module",
+	"license": "MIT",
+	"keywords": ["pi-package", "pi-extension", "pi-coding-agent", "herdr", "agent", "delegation"],
+	"pi": {
+		"extensions": ["./src/index.ts"]
+	},
+	"files": ["src", "README.md", "LICENSE"],
+	"scripts": {
+		"typecheck": "tsc --noEmit",
+		"lint": "biome check .",
+		"test": "vitest run"
+	},
+	"dependencies": {
+		"typebox": "^1.1.38"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-ai": ">=0.80.0 <1",
+		"@earendil-works/pi-coding-agent": ">=0.80.0 <1"
+	},
+	"devDependencies": {
+		"@biomejs/biome": "^1.9.4",
+		"@earendil-works/pi-ai": "^0.80.6",
+		"@earendil-works/pi-coding-agent": "^0.80.6",
+		"@types/node": "^22.15.0",
+		"typebox": "^1.1.38",
+		"typescript": "^5.8.3",
+		"vitest": "^3.2.4"
+	}
+}
