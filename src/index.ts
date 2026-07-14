@@ -22,6 +22,7 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	pi.on("before_agent_start", (event) => {
+		if (process.env.HERDR_ENV !== "1") return;
 		if (event.systemPrompt.includes("<herdr-peer-delegation>")) return;
 		return {
 			systemPrompt: `${event.systemPrompt}\n\n${HERDR_PARENT_SYSTEM_PROMPT}`,

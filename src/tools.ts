@@ -1,7 +1,7 @@
 import { StringEnum } from "@earendil-works/pi-ai";
 import { defineTool } from "@earendil-works/pi-coding-agent";
 import type { ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { Type, type Static } from "typebox";
+import { type Static, Type } from "typebox";
 import type { HerdrAdapter } from "./herdr-adapter.js";
 import { createHerdrAdapter } from "./herdr-adapter.js";
 import {
@@ -185,7 +185,9 @@ export function createHerdrAgentTools(host: ToolHost): ToolDefinition[] {
 					return args as LaunchToolParams;
 				}
 				const input = args as Partial<LaunchToolParams>;
-				return (input.role === undefined ? { ...input, role: "general" } : input) as LaunchToolParams;
+				return (
+					input.role === undefined ? { ...input, role: "general" } : input
+				) as LaunchToolParams;
 			},
 			async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 				const deps = makeDeps(host, ctx);

@@ -73,6 +73,7 @@ export function buildRoleAssignment(roleName: string, role: AgentRole, task: str
 		`<herdr-peer-role name="${roleName}">`,
 		role.prompt,
 		"You are an independent peer process in a visible Herdr pane. You do not inherit the caller's conversation; rely only on this assignment and the project files you inspect.",
+		"Do not launch, delegate to, or coordinate another agent unless this assignment explicitly requires it.",
 		"</herdr-peer-role>",
 		"",
 		"<assignment>",
