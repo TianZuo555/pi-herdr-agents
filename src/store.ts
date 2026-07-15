@@ -92,6 +92,22 @@ export class AgentStore {
 		return structuredClone(copy);
 	}
 
+	/**
+	 * Next free column-fill layout slot for a tab. Callers must claim the
+	 * returned value via upsert() with zero `await` in between: this method
+	 * only reads the current occupancy, so its safety against concurrent
+	 * launches depends on that synchronous read-then-claim discipline.
+	 */
+	reserveLayoutSlot(tabId: string): number {
+		let max = 0;
+		for (const record of this.records.values()) {
+			if (record.layoutTabId !== tabId) continue;
+			if (record.stopped || record.lost) continue;
+			if (record.layoutSlot !== undefined && record.layoutSlot > max) max = record.layoutSlot;
+		}
+		return max + 1;
+	}
+
 	persist(): void {
 		const snapshot: SnapshotV1 = {
 			version: SNAPSHOT_VERSION,

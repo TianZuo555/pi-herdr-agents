@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import {
 	buildAgentStartArgv,
+	buildPaneMoveArgv,
 	createHerdrAdapter,
 	parseAgentStatusWait,
 	parseHerdrEnvelope,
@@ -186,5 +187,99 @@ describe("herdr adapter parsing", () => {
 				tabId: "w1:t1",
 			}),
 		).toThrow(/both workspace and tab/);
+	});
+
+	it("builds pane move argv in the order the herdr CLI expects", () => {
+		const argv = buildPaneMoveArgv("w1:p2", {
+			tabId: "w1:t1",
+			targetPaneId: "w1:p1",
+			split: "right",
+		});
+		expect(argv).toEqual([
+			"pane",
+			"move",
+			"w1:p2",
+			"--tab",
+			"w1:t1",
+			"--split",
+			"right",
+			"--target-pane",
+			"w1:p1",
+		]);
+	});
+
+	it("appends ratio and focus flags for pane move", () => {
+		const argv = buildPaneMoveArgv("w1:p2", {
+			tabId: "w1:t1",
+			targetPaneId: "w1:p1",
+			split: "down",
+			ratio: 0.4,
+			focus: false,
+		});
+		expect(argv).toEqual([
+			"pane",
+			"move",
+			"w1:p2",
+			"--tab",
+			"w1:t1",
+			"--split",
+			"down",
+			"--target-pane",
+			"w1:p1",
+			"--ratio",
+			"0.4",
+			"--no-focus",
+		]);
+	});
+
+	it("rejects NUL bytes and invalid split values for pane move", () => {
+		expect(() =>
+			buildPaneMoveArgv("w1:p2\0", { tabId: "w1:t1", targetPaneId: "w1:p1", split: "right" }),
+		).toThrow(/pane id/);
+		expect(() =>
+			buildPaneMoveArgv("w1:p2", { tabId: "", targetPaneId: "w1:p1", split: "right" }),
+		).toThrow(/tab id/);
+		expect(() =>
+			buildPaneMoveArgv("w1:p2", { tabId: "w1:t1", targetPaneId: "", split: "right" }),
+		).toThrow(/target pane id/);
+		expect(() =>
+			buildPaneMoveArgv("w1:p2", {
+				tabId: "w1:t1",
+				targetPaneId: "w1:p1",
+				// biome-ignore lint/suspicious/noExplicitAny: exercising runtime validation of an invalid enum value
+				split: "sideways" as any,
+			}),
+		).toThrow(/split must be/);
+	});
+
+	it("pane move resolves on success and surfaces herdr errors on failure", async () => {
+		const exec = vi.fn(async () => ({
+			stdout: '{"ok":true,"result":{"type":"pane_move","move_result":{"changed":true}}}',
+			stderr: "",
+			code: 0,
+			killed: false,
+		}));
+		const adapter = createHerdrAdapter(exec);
+		await expect(
+			adapter.paneMove("w1:p2", { tabId: "w1:t1", targetPaneId: "w1:p1", split: "right" }),
+		).resolves.toBeUndefined();
+		expect(exec).toHaveBeenCalledWith(
+			"herdr",
+			["pane", "move", "w1:p2", "--tab", "w1:t1", "--split", "right", "--target-pane", "w1:p1"],
+			expect.objectContaining({ timeout: 30_000 }),
+		);
+	});
+
+	it("pane move rejects with the herdr error message on failure", async () => {
+		const exec = vi.fn(async () => ({
+			stdout: '{"error":{"code":"target_pane_not_found","message":"target pane w1:p1 not found"}}',
+			stderr: "",
+			code: 1,
+			killed: false,
+		}));
+		const adapter = createHerdrAdapter(exec);
+		await expect(
+			adapter.paneMove("w1:p2", { tabId: "w1:t1", targetPaneId: "w1:p1", split: "right" }),
+		).rejects.toThrow(/target_pane_not_found/);
 	});
 });

@@ -3,6 +3,7 @@ import { resolve } from "node:path";
 import { requireHerdrContext } from "./env.js";
 import type { HerdrAdapter } from "./herdr-adapter.js";
 import { generateAgentId, makeHerdrAgentName } from "./ids.js";
+import { resolveLayoutAnchor } from "./layout.js";
 import { PollAbortedError, PollTimeoutError, pollUntil } from "./poll.js";
 import { getProfile } from "./profiles.js";
 import { buildRoleAssignment } from "./roles.js";
@@ -392,6 +393,10 @@ export async function launchAgent(
 	const agentId = generateAgentId();
 	const herdrName = makeHerdrAgentName(`${roleName}-${profileName}`, agentId);
 	const herdrCtx = env.context;
+	// Auto-layout only applies to same-workspace launches with no explicit split:
+	// an explicit split is a deliberate override, and a workspace launch lands in
+	// a tab the caller doesn't know ahead of time, so there is no grid to join.
+	const useAutoLayout = params.split === undefined && params.workspace === undefined;
 	const startResult = await deps.adapter.agentStart(
 		{
 			name: herdrName,
@@ -399,6 +404,7 @@ export async function launchAgent(
 			cwd,
 			workspaceId: params.workspace,
 			tabId: params.tab ?? (params.workspace ? undefined : herdrCtx.tabId),
+			// Auto-layout starts at a throwaway position; paneMove relocates it below.
 			split: params.split ?? "right",
 			focus: params.focus ?? false,
 			timeoutMs: startupTimeoutMs,
@@ -408,7 +414,18 @@ export async function launchAgent(
 
 	// This is intentionally the first persistence point after Herdr returns an
 	// opaque pane identity. Every later failure can therefore be recovered.
+	//
+	// Everything from here through store.upsert() below is one synchronous
+	// stretch with no `await` in between. That is what makes layout-slot
+	// reservation race-free under concurrent launchAgent() calls: two calls
+	// can run agentStart concurrently, but each one's post-await continuation
+	// runs to completion (uninterrupted) before the other's continuation gets
+	// a turn, so reserveLayoutSlot's synchronous scan can never observe two
+	// launches mid-claim at once.
 	const identity = identityFromPane(startResult.agent);
+	const layoutTabId = useAutoLayout ? (params.tab ?? herdrCtx.tabId) : undefined;
+	const layoutSlot =
+		useAutoLayout && layoutTabId ? deps.store.reserveLayoutSlot(layoutTabId) : undefined;
 	let record = deps.store.upsert({
 		id: agentId,
 		role: roleName,
@@ -427,7 +444,38 @@ export async function launchAgent(
 		owned: true,
 		stopped: false,
 		lost: false,
+		layoutSlot,
+		layoutTabId,
 	});
+
+	if (layoutSlot !== undefined && layoutTabId) {
+		try {
+			const anchor = await resolveLayoutAnchor(
+				deps.adapter,
+				deps.store,
+				layoutTabId,
+				herdrCtx.paneId,
+				layoutSlot,
+				signal,
+			);
+			await deps.adapter.paneMove(
+				identity.paneId,
+				{
+					tabId: layoutTabId,
+					targetPaneId: anchor.targetPaneId,
+					split: anchor.split,
+					focus: params.focus ?? false,
+				},
+				signal,
+			);
+		} catch (error) {
+			// Degrade gracefully: a misplaced-but-working peer beats a failed launch.
+			record =
+				deps.store.mutate(agentId, (current) => {
+					current.error = `Layout placement failed: ${error instanceof Error ? error.message : String(error)}`;
+				}) ?? record;
+		}
+	}
 
 	const pollBase: PollOptions = {
 		...pollOptions,

@@ -33,6 +33,7 @@ src/types.ts          Shared types, constants, identity/completion helpers
 src/env.ts            HERDR_* caller context validation
 src/poll.ts           Generic pollUntil with abort/timeout
 src/ids.ts            Opaque agent id + Herdr display name generation
+src/layout.ts         Column-fill grid math + live anchor-pane resolution
 test/fake-adapter.ts  FakeHerdrAdapter for lifecycle/adapter tests
 ```
 

@@ -46,6 +46,16 @@ describe("lifecycle", () => {
 		cwd = mkdtempSync(join(tmpdir(), "herdr-life-"));
 		store = new AgentStore();
 		adapter = new FakeHerdrAdapter();
+		// The caller's own pane, so auto-layout's slot-1 paneMove has a real
+		// target instead of failing FakeHerdrAdapter's target-pane-exists check.
+		adapter.addPane({
+			paneId: "w1:p0",
+			terminalId: "term_caller",
+			workspaceId: "w1",
+			tabId: "w1:t1",
+			agentStatus: "idle",
+			transcript: "",
+		});
 	});
 
 	afterEach(() => {
@@ -352,6 +362,208 @@ describe("lifecycle", () => {
 
 		const start = adapter.calls.find((call) => call.method === "agentStart");
 		expect(start?.args[0]).toMatchObject({ timeoutMs: 9000 });
+	});
+
+	async function driveBackgroundLaunch(
+		deps: ReturnType<typeof makeDeps>,
+		prompt: string,
+	): Promise<{ agentId: string; paneId: string }> {
+		const startCountBefore = adapter.calls.filter((c) => c.method === "agentStart").length;
+		const launchPromise = launchAgent(
+			deps,
+			{ cwd },
+			{ profile: "pi", prompt, mode: "background", startupTimeoutMs: 5000 },
+			undefined,
+			{ sleep: noSleep, pollIntervalMs: 1 },
+		);
+		// FakeHerdrAdapter assigns pane ids "w1:pN" in agentStart call order.
+		const paneId = `w1:p${startCountBefore + 1}`;
+		await vi.waitFor(() => expect(adapter.getPane(paneId)).toBeDefined());
+		adapter.setStatus(paneId, "idle");
+		await vi.waitFor(() =>
+			expect(adapter.calls.some((c) => c.method === "paneRun" && c.args[0] === paneId)).toBe(true),
+		);
+		adapter.setStatus(paneId, "working");
+		const result = await launchPromise;
+		return { agentId: result.agentId, paneId };
+	}
+
+	it("places sequential launches in a column-fill grid", async () => {
+		const deps = makeDeps(adapter, store);
+
+		const a1 = await driveBackgroundLaunch(deps, "peer 1");
+		const a2 = await driveBackgroundLaunch(deps, "peer 2");
+		const a3 = await driveBackgroundLaunch(deps, "peer 3");
+		const a4 = await driveBackgroundLaunch(deps, "peer 4");
+
+		expect(store.get(a1.agentId)?.layoutSlot).toBe(1);
+		expect(store.get(a2.agentId)?.layoutSlot).toBe(2);
+		expect(store.get(a3.agentId)?.layoutSlot).toBe(3);
+		expect(store.get(a4.agentId)?.layoutSlot).toBe(4);
+
+		expect(adapter.moves).toEqual([
+			{ paneId: a1.paneId, tabId: "w1:t1", targetPaneId: "w1:p0", split: "right" },
+			{ paneId: a2.paneId, tabId: "w1:t1", targetPaneId: a1.paneId, split: "down" },
+			{ paneId: a3.paneId, tabId: "w1:t1", targetPaneId: a2.paneId, split: "down" },
+			{ paneId: a4.paneId, tabId: "w1:t1", targetPaneId: a1.paneId, split: "right" },
+		]);
+	});
+
+	it("bypasses auto-layout when split is explicit", async () => {
+		const deps = makeDeps(adapter, store);
+		const launchPromise = launchAgent(
+			deps,
+			{ cwd },
+			{ profile: "pi", prompt: "explicit split", mode: "background", split: "down" },
+			undefined,
+			{ sleep: noSleep, pollIntervalMs: 1 },
+		);
+		await vi.waitFor(() => adapter.getPane("w1:p1"));
+		adapter.setStatus("w1:p1", "idle");
+		await vi.waitFor(() => expect(adapter.calls.some((c) => c.method === "paneRun")).toBe(true));
+		adapter.setStatus("w1:p1", "working");
+		const result = await launchPromise;
+
+		expect(store.get(result.agentId)?.layoutSlot).toBeUndefined();
+		expect(adapter.calls.some((c) => c.method === "paneMove")).toBe(false);
+		const start = adapter.calls.find((c) => c.method === "agentStart");
+		expect(start?.args[0]).toMatchObject({ split: "down" });
+	});
+
+	it("bypasses auto-layout for workspace-targeted launches", async () => {
+		const deps = makeDeps(adapter, store);
+		const launchPromise = launchAgent(
+			deps,
+			{ cwd },
+			{ profile: "pi", prompt: "cross workspace", mode: "background", workspace: "w2" },
+			undefined,
+			{ sleep: noSleep, pollIntervalMs: 1 },
+		);
+		await vi.waitFor(() => adapter.getPane("w1:p1"));
+		adapter.setStatus("w1:p1", "idle");
+		await vi.waitFor(() => expect(adapter.calls.some((c) => c.method === "paneRun")).toBe(true));
+		adapter.setStatus("w1:p1", "working");
+		const result = await launchPromise;
+
+		expect(store.get(result.agentId)?.layoutSlot).toBeUndefined();
+		expect(adapter.calls.some((c) => c.method === "paneMove")).toBe(false);
+	});
+
+	it("falls back to the caller's pane when the layout anchor is lost", async () => {
+		const deps = makeDeps(adapter, store);
+		store.upsert({
+			id: "herdr-agent-anchor-lost-1",
+			profile: "pi",
+			description: "gone",
+			prompt: "x",
+			cwd,
+			herdrName: "pi-lost",
+			identity: {
+				paneId: "w1:p99",
+				terminalId: "term_99",
+				workspaceId: "w1",
+				tabId: "w1:t1",
+			},
+			agentStatus: "working",
+			recordStatus: "working",
+			seenWorking: true,
+			mode: "background",
+			launchedAt: Date.now(),
+			owned: true,
+			stopped: false,
+			lost: false,
+			layoutSlot: 1,
+			layoutTabId: "w1:t1",
+		});
+
+		const launchPromise = launchAgent(
+			deps,
+			{ cwd },
+			{ profile: "pi", prompt: "peer 2", mode: "background", startupTimeoutMs: 5000 },
+			undefined,
+			{ sleep: noSleep, pollIntervalMs: 1 },
+		);
+		await vi.waitFor(() => adapter.getPane("w1:p1"));
+		adapter.setStatus("w1:p1", "idle");
+		await vi.waitFor(() => expect(adapter.calls.some((c) => c.method === "paneRun")).toBe(true));
+		adapter.setStatus("w1:p1", "working");
+		const result = await launchPromise;
+
+		expect(store.get(result.agentId)?.layoutSlot).toBe(2);
+		expect(adapter.moves).toEqual([
+			{ paneId: "w1:p1", tabId: "w1:t1", targetPaneId: "w1:p0", split: "right" },
+		]);
+	});
+
+	it("degrades gracefully when paneMove fails, keeping the launch alive", async () => {
+		const deps = makeDeps(adapter, store);
+		adapter.paneMove = async () => {
+			throw new Error("boom");
+		};
+
+		const launchPromise = launchAgent(
+			deps,
+			{ cwd },
+			{ profile: "pi", prompt: "degrade", mode: "background", startupTimeoutMs: 5000 },
+			undefined,
+			{ sleep: noSleep, pollIntervalMs: 1 },
+		);
+		await vi.waitFor(() => adapter.getPane("w1:p1"));
+		adapter.setStatus("w1:p1", "idle");
+		await vi.waitFor(() => expect(adapter.calls.some((c) => c.method === "paneRun")).toBe(true));
+		adapter.setStatus("w1:p1", "working");
+		const result = await launchPromise;
+
+		expect(result.partial).toBe(false);
+		expect(result.seenWorking).toBe(true);
+		const record = store.get(result.agentId);
+		expect(record?.layoutSlot).toBe(1);
+		expect(record?.error).toContain("Layout placement failed");
+	});
+
+	it("assigns distinct layout slots to concurrent launches", async () => {
+		const deps = makeDeps(adapter, store);
+		const resultsPromise = Promise.all([
+			launchAgent(
+				deps,
+				{ cwd },
+				{ profile: "pi", prompt: "concurrent a", mode: "background", startupTimeoutMs: 5000 },
+				undefined,
+				{ sleep: noSleep, pollIntervalMs: 1 },
+			),
+			launchAgent(
+				deps,
+				{ cwd },
+				{ profile: "pi", prompt: "concurrent b", mode: "background", startupTimeoutMs: 5000 },
+				undefined,
+				{ sleep: noSleep, pollIntervalMs: 1 },
+			),
+			launchAgent(
+				deps,
+				{ cwd },
+				{ profile: "pi", prompt: "concurrent c", mode: "background", startupTimeoutMs: 5000 },
+				undefined,
+				{ sleep: noSleep, pollIntervalMs: 1 },
+			),
+		]);
+
+		await vi.waitFor(() =>
+			expect(adapter.calls.filter((c) => c.method === "agentStart").length).toBe(3),
+		);
+		for (const paneId of ["w1:p1", "w1:p2", "w1:p3"]) {
+			adapter.setStatus(paneId, "idle");
+		}
+		await vi.waitFor(() =>
+			expect(adapter.calls.filter((c) => c.method === "paneRun").length).toBe(3),
+		);
+		for (const paneId of ["w1:p1", "w1:p2", "w1:p3"]) {
+			adapter.setStatus(paneId, "working");
+		}
+		const results = await resultsPromise;
+
+		const slots = results.map((r) => store.get(r.agentId)?.layoutSlot);
+		expect(new Set(slots)).toEqual(new Set([1, 2, 3]));
+		expect(slots.every((slot) => slot !== undefined)).toBe(true);
 	});
 
 	it("stop validates ownership and closes pane", async () => {

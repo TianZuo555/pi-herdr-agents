@@ -6,6 +6,7 @@ import type {
 	AgentStatusWaitOptions,
 	HerdrAdapter,
 	PaneInfoResult,
+	PaneMoveOptions,
 	PaneReadResult,
 } from "../src/types.js";
 
@@ -30,6 +31,12 @@ interface StatusWaiter {
 
 export class FakeHerdrAdapter implements HerdrAdapter {
 	public calls: Array<{ method: string; args: unknown[] }> = [];
+	public moves: Array<{
+		paneId: string;
+		tabId: string;
+		targetPaneId: string;
+		split: "right" | "down";
+	}> = [];
 	private panes = new Map<string, FakePaneState>();
 	private statusWaiters = new Map<string, StatusWaiter[]>();
 	private counter = 0;
@@ -181,6 +188,25 @@ export class FakeHerdrAdapter implements HerdrAdapter {
 			const waiters = this.statusWaiters.get(paneId) ?? [];
 			waiters.push({ target: status, resolve, reject, timer, onAbort });
 			this.statusWaiters.set(paneId, waiters);
+		});
+	}
+
+	async paneMove(paneId: string, options: PaneMoveOptions): Promise<void> {
+		this.calls.push({ method: "paneMove", args: [paneId, options] });
+		const pane = this.panes.get(paneId);
+		if (!pane || pane.closed) throw new Error(`pane not found: ${paneId}`);
+		const target = this.panes.get(options.targetPaneId);
+		if (!target || target.closed) {
+			throw new Error(
+				`pane move: target_pane_not_found: target pane ${options.targetPaneId} not found`,
+			);
+		}
+		pane.tabId = options.tabId;
+		this.moves.push({
+			paneId,
+			tabId: options.tabId,
+			targetPaneId: options.targetPaneId,
+			split: options.split,
 		});
 	}
 

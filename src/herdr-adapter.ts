@@ -7,6 +7,7 @@ import type {
 	ExecFn,
 	HerdrEnvelope,
 	PaneInfoResult,
+	PaneMoveOptions,
 	PaneReadResult,
 } from "./types.js";
 import { formatHerdrError } from "./types.js";
@@ -227,6 +228,39 @@ export function buildAgentStartArgv(options: AgentStartOptions): string[] {
 	return argv;
 }
 
+export function buildPaneMoveArgv(paneId: string, options: PaneMoveOptions): string[] {
+	if (!paneId || paneId.includes("\0")) {
+		throw new Error("pane move pane id must be a non-empty string without NUL bytes");
+	}
+	if (!options.tabId || options.tabId.includes("\0")) {
+		throw new Error("pane move tab id must be a non-empty string without NUL bytes");
+	}
+	if (!options.targetPaneId || options.targetPaneId.includes("\0")) {
+		throw new Error("pane move target pane id must be a non-empty string without NUL bytes");
+	}
+	if (options.split !== "right" && options.split !== "down") {
+		throw new Error(`pane move split must be "right" or "down", got "${options.split}"`);
+	}
+	validateCliValue(options.tabId, "pane move tab id");
+	validateCliValue(options.targetPaneId, "pane move target pane id");
+
+	const argv = [
+		"pane",
+		"move",
+		paneId,
+		"--tab",
+		options.tabId,
+		"--split",
+		options.split,
+		"--target-pane",
+		options.targetPaneId,
+	];
+	if (options.ratio !== undefined) argv.push("--ratio", String(options.ratio));
+	if (options.focus === true) argv.push("--focus");
+	if (options.focus === false) argv.push("--no-focus");
+	return argv;
+}
+
 export function createHerdrAdapter(exec: ExecFn): import("./types.js").HerdrAdapter {
 	async function runHerdr(
 		argv: string[],
@@ -331,6 +365,10 @@ export function createHerdrAdapter(exec: ExecFn): import("./types.js").HerdrAdap
 				throw new PollTimeoutError("Timed out waiting for agent status change");
 			}
 			throw new Error(`wait agent-status ${status}: ${message.slice(0, 400)}`);
+		},
+
+		async paneMove(paneId, options, signal) {
+			await runHerdr(buildPaneMoveArgv(paneId, options), signal, "pane move");
 		},
 
 		async paneClose(paneId, signal) {

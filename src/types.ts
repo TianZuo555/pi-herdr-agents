@@ -50,6 +50,10 @@ export interface AgentRecord {
 	owned: boolean;
 	stopped: boolean;
 	lost: boolean;
+	/** Column-fill auto-layout slot (1-based), when auto-layout placed this pane. */
+	layoutSlot?: number;
+	/** Herdr tab id the layoutSlot numbering is scoped to. Present iff layoutSlot is present. */
+	layoutTabId?: string;
 }
 
 export interface AgentProfile {
@@ -214,6 +218,14 @@ export interface AgentStatusWaitOptions {
 	timeoutMs?: number;
 }
 
+export interface PaneMoveOptions {
+	tabId: string;
+	targetPaneId: string;
+	split: "right" | "down";
+	focus?: boolean;
+	ratio?: number;
+}
+
 export interface HerdrAdapter {
 	agentStart(options: AgentStartOptions, signal?: AbortSignal): Promise<AgentStartedResult>;
 	paneGet(paneId: string, signal?: AbortSignal): Promise<PaneInfoResult | undefined>;
@@ -228,6 +240,7 @@ export interface HerdrAdapter {
 		status: AgentStatus,
 		options?: AgentStatusWaitOptions,
 	): Promise<AgentStatus>;
+	paneMove(paneId: string, options: PaneMoveOptions, signal?: AbortSignal): Promise<void>;
 	paneClose(paneId: string, signal?: AbortSignal): Promise<void>;
 }
 

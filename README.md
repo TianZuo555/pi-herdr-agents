@@ -95,7 +95,15 @@ On every caller turn, the extension appends a marked system-prompt section expla
 
 ### `herdr_launch_agent`
 
-Launch a peer agent in a new pane (default: split right in the caller's tab, no focus).
+Launch a peer agent in a new pane. By default, panes auto-arrange into a column-fill grid in the caller's tab: the 1st peer splits right of the caller, the 2nd and 3rd stack downward under it, the 4th starts a new column anchored on the 1st peer's pane (splitting right), and so on — every 3rd peer opens a new column, keeping columns vertically aligned.
+
+```
+[Caller][P1]  [P4]
+        [P2]  [P5]
+        [P3]  [P6]
+```
+
+Passing an explicit `split`, or targeting a different `workspace`, opts out of auto-layout for that call and falls back to the raw `split`/`focus` placement below. If the pane a new peer would anchor on is no longer live (closed, lost, or identity mismatch), the peer falls back to splitting right of the caller's own pane rather than failing the launch.
 
 | Parameter | Description |
 |-----------|-------------|
@@ -105,8 +113,8 @@ Launch a peer agent in a new pane (default: split right in the caller's tab, no 
 | `description` | Optional short label stored on the record |
 | `mode` | `background` (default) or `foreground` |
 | `cwd` | Working directory (default: Pi project cwd) |
-| `workspace` / `tab` | Launch topology (mutually exclusive) |
-| `split` | `right` (default) or `down` |
+| `workspace` / `tab` | Launch topology (mutually exclusive); setting `workspace` opts out of auto-layout |
+| `split` | `right` or `down`; setting this opts out of auto-layout for this call |
 | `focus` | Focus new pane (default `false`) |
 | `startup_timeout_ms` | State transition timeout |
 | `completion_timeout_ms` | Foreground completion timeout |
