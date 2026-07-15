@@ -232,10 +232,11 @@ export function createHerdrAdapter(exec: ExecFn): import("./types.js").HerdrAdap
 		argv: string[],
 		signal?: AbortSignal,
 		context = "herdr",
+		timeoutMs = 30_000,
 	): Promise<string> {
 		let result: Awaited<ReturnType<ExecFn>>;
 		try {
-			result = await exec("herdr", argv, { signal, timeout: 30_000 });
+			result = await exec("herdr", argv, { signal, timeout: timeoutMs });
 		} catch (error) {
 			if (signal?.aborted) throw new PollAbortedError();
 			throw error;
@@ -253,7 +254,12 @@ export function createHerdrAdapter(exec: ExecFn): import("./types.js").HerdrAdap
 
 	return {
 		async agentStart(options, signal) {
-			const stdout = await runHerdr(buildAgentStartArgv(options), signal, "agent start");
+			const stdout = await runHerdr(
+				buildAgentStartArgv(options),
+				signal,
+				"agent start",
+				options.timeoutMs,
+			);
 			return validateAgentStarted(
 				assertEnvelope(parseHerdrEnvelope<unknown>(stdout), "agent start"),
 			);

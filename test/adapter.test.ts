@@ -76,6 +76,70 @@ describe("herdr adapter parsing", () => {
 		);
 	});
 
+	it("forwards a custom startup timeout to the agent start exec call", async () => {
+		const exec = vi.fn(async () => ({
+			stdout: JSON.stringify({
+				ok: true,
+				result: {
+					type: "agent_started",
+					agent: {
+						pane_id: "w1:p1",
+						terminal_id: "term_1",
+						workspace_id: "w1",
+						tab_id: "w1:t1",
+						agent_status: "unknown",
+					},
+					argv: ["pi"],
+				},
+			}),
+			stderr: "",
+			code: 0,
+			killed: false,
+		}));
+		const adapter = createHerdrAdapter(exec);
+		await adapter.agentStart({
+			name: "pi-abc",
+			argv: ["pi"],
+			cwd: "/tmp/work",
+			tabId: "w1:t1",
+			timeoutMs: 9000,
+		});
+		expect(exec).toHaveBeenCalledWith(
+			"herdr",
+			expect.any(Array),
+			expect.objectContaining({ timeout: 9000 }),
+		);
+	});
+
+	it("defaults the agent start exec timeout to 30s when unset", async () => {
+		const exec = vi.fn(async () => ({
+			stdout: JSON.stringify({
+				ok: true,
+				result: {
+					type: "agent_started",
+					agent: {
+						pane_id: "w1:p1",
+						terminal_id: "term_1",
+						workspace_id: "w1",
+						tab_id: "w1:t1",
+						agent_status: "unknown",
+					},
+					argv: ["pi"],
+				},
+			}),
+			stderr: "",
+			code: 0,
+			killed: false,
+		}));
+		const adapter = createHerdrAdapter(exec);
+		await adapter.agentStart({ name: "pi-abc", argv: ["pi"], cwd: "/tmp/work", tabId: "w1:t1" });
+		expect(exec).toHaveBeenCalledWith(
+			"herdr",
+			expect.any(Array),
+			expect.objectContaining({ timeout: 30_000 }),
+		);
+	});
+
 	it("parses agent-status wait events", () => {
 		expect(
 			parseAgentStatusWait(

@@ -401,6 +401,7 @@ export async function launchAgent(
 			tabId: params.tab ?? (params.workspace ? undefined : herdrCtx.tabId),
 			split: params.split ?? "right",
 			focus: params.focus ?? false,
+			timeoutMs: startupTimeoutMs,
 		},
 		signal,
 	);
@@ -652,6 +653,8 @@ export async function steerAgent(
 	signal?: AbortSignal,
 ): Promise<AgentRecord> {
 	if (!params.message || !params.message.trim()) throw new Error("message is required");
+	if (params.message.length > 100_000) throw new Error("message exceeds 100000 characters");
+	if (params.message.includes("\0")) throw new Error("message must not contain NUL bytes");
 	const record = deps.store.get(params.agentId);
 	if (!record) throw new Error(`Unknown agent id "${params.agentId}"`);
 	if (record.stopped) throw new Error(`Agent "${params.agentId}" is stopped`);

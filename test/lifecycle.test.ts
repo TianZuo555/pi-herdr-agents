@@ -311,6 +311,49 @@ describe("lifecycle", () => {
 		expect(adapter.calls.filter((c) => c.method === "paneRun").length).toBeGreaterThan(1);
 	});
 
+	it("rejects an oversized or NUL-containing steer message", async () => {
+		const deps = makeDeps(adapter, store);
+		const launchPromise = launchAgent(
+			deps,
+			{ cwd },
+			{ profile: "pi", prompt: "first", mode: "background", startupTimeoutMs: 5000 },
+			undefined,
+			{ sleep: noSleep, pollIntervalMs: 1 },
+		);
+		await vi.waitFor(() => adapter.getPane("w1:p1"));
+		adapter.setStatus("w1:p1", "idle");
+		const launched = await launchPromise;
+		await vi.waitFor(() => adapter.calls.some((c) => c.method === "paneRun"));
+		adapter.setStatus("w1:p1", "working");
+		await vi.waitFor(() => store.get(launched.agentId)?.seenWorking);
+
+		await expect(
+			steerAgent(deps, { agentId: launched.agentId, message: "x".repeat(100_001) }),
+		).rejects.toThrow(/exceeds 100000 characters/);
+		await expect(
+			steerAgent(deps, { agentId: launched.agentId, message: "bad\0byte" }),
+		).rejects.toThrow(/NUL bytes/);
+	});
+
+	it("passes the startup timeout through to agent start", async () => {
+		const deps = makeDeps(adapter, store);
+		const launchPromise = launchAgent(
+			deps,
+			{ cwd },
+			{ profile: "pi", prompt: "timeout wiring", mode: "background", startupTimeoutMs: 9000 },
+			undefined,
+			{ sleep: noSleep, pollIntervalMs: 1 },
+		);
+		await vi.waitFor(() => adapter.getPane("w1:p1"));
+		adapter.setStatus("w1:p1", "idle");
+		await vi.waitFor(() => expect(adapter.calls.some((c) => c.method === "paneRun")).toBe(true));
+		adapter.setStatus("w1:p1", "working");
+		await launchPromise;
+
+		const start = adapter.calls.find((call) => call.method === "agentStart");
+		expect(start?.args[0]).toMatchObject({ timeoutMs: 9000 });
+	});
+
 	it("stop validates ownership and closes pane", async () => {
 		const deps = makeDeps(adapter, store);
 		const launchPromise = launchAgent(

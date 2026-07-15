@@ -117,7 +117,11 @@ const ResultParamsSchema = Type.Object({
 
 const SteerParamsSchema = Type.Object({
 	agent_id: Type.String({ description: "Tracked extension agent id" }),
-	message: Type.String({ description: "Follow-up prompt sent via herdr pane run" }),
+	message: Type.String({
+		minLength: 1,
+		maxLength: 100_000,
+		description: "Follow-up prompt sent via herdr pane run",
+	}),
 });
 
 const StopParamsSchema = Type.Object({

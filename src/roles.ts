@@ -68,7 +68,14 @@ export function listRoleNames(roles: Record<string, AgentRole>): string[] {
 	return Object.keys(roles).sort();
 }
 
+const RESERVED_ASSIGNMENT_DELIMITERS = /<\/assignment>|<herdr-peer-role\b/i;
+
 export function buildRoleAssignment(roleName: string, role: AgentRole, task: string): string {
+	if (RESERVED_ASSIGNMENT_DELIMITERS.test(task)) {
+		throw new Error(
+			'task must not contain the reserved delimiter tags "</assignment>" or "<herdr-peer-role"',
+		);
+	}
 	return [
 		`<herdr-peer-role name="${roleName}">`,
 		role.prompt,

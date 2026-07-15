@@ -199,6 +199,8 @@ export interface AgentStartOptions {
 	tabId?: string;
 	split?: "right" | "down";
 	focus?: boolean;
+	/** Exec timeout for the `herdr agent start` process spawn. Defaults to 30s. */
+	timeoutMs?: number;
 }
 
 export type ExecFn = (
