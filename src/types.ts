@@ -10,6 +10,7 @@ export type RecordStatus =
 	| "idle"
 	| "done"
 	| "unknown"
+	| "unavailable"
 	| "stopped"
 	| "lost"
 	| "error"
@@ -17,6 +18,8 @@ export type RecordStatus =
 	| "aborted";
 
 export type LaunchMode = "foreground" | "background";
+export type WriteAccess = "none" | "workspace";
+export type SubmissionState = "pending" | "submitted" | "acknowledged";
 
 export interface AgentIdentity {
 	paneId: string;
@@ -32,8 +35,15 @@ export interface AgentRecord {
 	role?: string;
 	profile: string;
 	description: string;
-	prompt: string;
+	/** Legacy snapshot field. New snapshots never persist task prompt text. */
+	prompt?: string;
 	cwd: string;
+	/** Whether this role holds an exclusive write lease for cwd while active. */
+	writeAccess?: WriteAccess;
+	/** Initial assignment delivery state. Optional for older snapshots. */
+	submissionState?: SubmissionState;
+	/** Non-secret marker used to confirm that the peer TUI accepted the assignment. */
+	taskMarker?: string;
 	/** Display name passed to `herdr agent start`. */
 	herdrName: string;
 	identity: AgentIdentity;
@@ -67,6 +77,8 @@ export interface AgentRole {
 	description: string;
 	/** Trusted instruction prepended to the assignment sent to the peer. */
 	prompt: string;
+	/** Workspace writers are serialized per canonical cwd. */
+	writeAccess: WriteAccess;
 }
 
 export interface ProfilesConfig {
@@ -134,6 +146,7 @@ export interface AgentResult {
 export interface SteerParams {
 	agentId: string;
 	message: string;
+	forceResubmit?: boolean;
 }
 
 export interface StopParams {
@@ -168,6 +181,9 @@ export interface HerdrPane {
 	workspace_id: string;
 	tab_id: string;
 	agent_status: AgentStatus;
+	/** Present on agent get/list records. */
+	name?: string;
+	cwd?: string;
 }
 
 export interface HerdrEnvelope<T> {
@@ -180,6 +196,11 @@ export interface AgentStartedResult {
 	type: "agent_started";
 	agent: HerdrPane;
 	argv: string[];
+}
+
+export interface AgentInfoResult {
+	type: "agent_info";
+	agent: HerdrPane;
 }
 
 export interface PaneInfoResult {
@@ -228,6 +249,7 @@ export interface PaneMoveOptions {
 
 export interface HerdrAdapter {
 	agentStart(options: AgentStartOptions, signal?: AbortSignal): Promise<AgentStartedResult>;
+	agentGet(target: string, signal?: AbortSignal): Promise<AgentInfoResult | undefined>;
 	paneGet(paneId: string, signal?: AbortSignal): Promise<PaneInfoResult | undefined>;
 	paneRead(
 		paneId: string,

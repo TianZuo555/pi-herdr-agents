@@ -12,6 +12,8 @@ describe("roles", () => {
 		expect(BUILTIN_ROLES.executor.profile).toBe("cursor");
 		expect(BUILTIN_ROLES.reviewer.profile).toBe("codex");
 		expect(BUILTIN_ROLES.researcher.profile).toBe("agy");
+		expect(BUILTIN_ROLES.executor.writeAccess).toBe("workspace");
+		expect(BUILTIN_ROLES.reviewer.writeAccess).toBe("none");
 	});
 
 	it("wraps a task with trusted role instructions", () => {

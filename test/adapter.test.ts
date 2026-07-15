@@ -5,6 +5,7 @@ import {
 	createHerdrAdapter,
 	parseAgentStatusWait,
 	parseHerdrEnvelope,
+	validateAgentInfo,
 	validateAgentStarted,
 	validatePaneInfo,
 	validatePaneRead,
@@ -45,6 +46,7 @@ describe("herdr adapter parsing", () => {
 			tab_id: "w1:t1",
 			agent_status: "working",
 		};
+		expect(validateAgentInfo({ type: "agent_info", agent: pane }).agent.pane_id).toBe("w1:p1");
 		expect(validatePaneInfo({ type: "pane_info", pane }).pane.agent_status).toBe("working");
 		expect(
 			validatePaneRead({
@@ -58,6 +60,34 @@ describe("herdr adapter parsing", () => {
 				read: { pane_id: "p1", text: "native", truncated: true },
 			}).read.text,
 		).toBe("native");
+	});
+
+	it("gets an agent by unique name for failed-start reconciliation", async () => {
+		const exec = vi.fn(async () => ({
+			stdout: JSON.stringify({
+				result: {
+					type: "agent_info",
+					agent: {
+						pane_id: "w1:p1",
+						terminal_id: "term_1",
+						workspace_id: "w1",
+						tab_id: "w1:t1",
+						agent_status: "idle",
+					},
+				},
+			}),
+			stderr: "",
+			code: 0,
+			killed: false,
+		}));
+		const adapter = createHerdrAdapter(exec);
+		const result = await adapter.agentGet("reviewer-codex-1");
+		expect(result?.agent.pane_id).toBe("w1:p1");
+		expect(exec).toHaveBeenCalledWith(
+			"herdr",
+			["agent", "get", "reviewer-codex-1"],
+			expect.objectContaining({ timeout: 30_000 }),
+		);
 	});
 
 	it("accepts raw text emitted by the pane-read CLI", async () => {

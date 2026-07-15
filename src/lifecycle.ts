@@ -1,8 +1,8 @@
-import { statSync } from "node:fs";
+import { realpathSync, statSync } from "node:fs";
 import { resolve } from "node:path";
 import { requireHerdrContext } from "./env.js";
 import type { HerdrAdapter } from "./herdr-adapter.js";
-import { generateAgentId, makeHerdrAgentName } from "./ids.js";
+import { generateAgentId, generateTaskMarker, makeHerdrAgentName } from "./ids.js";
 import { resolveLayoutAnchor } from "./layout.js";
 import { PollAbortedError, PollTimeoutError, pollUntil } from "./poll.js";
 import { getProfile } from "./profiles.js";
@@ -57,7 +57,12 @@ function boundedNumber(
 }
 
 function resolveCwd(cwd: string | undefined, fallback: string): string {
-	return resolve(cwd || fallback);
+	const absolute = resolve(cwd || fallback);
+	try {
+		return realpathSync(absolute);
+	} catch {
+		return absolute;
+	}
 }
 
 function mapAgentStatusToRecordStatus(
@@ -209,25 +214,45 @@ async function waitForPaneReady(
 
 function detectStartupBlocker(profile: string, screen: string): string | undefined {
 	if (profile === "cursor" && /trust this workspace/i.test(screen)) {
-		return "Cursor requires workspace trust. Focus the peer pane and approve it, then send the task with herdr_steer_agent.";
+		return "Cursor requires workspace trust. Focus the peer pane and approve it, then call herdr_steer_agent to resume the original task.";
 	}
 	if (profile === "agy" && /not signed in|signing in/i.test(screen)) {
-		return "Antigravity requires sign-in. Complete authentication in the peer pane, then send the task with herdr_steer_agent.";
+		return "Antigravity requires sign-in. Complete authentication in the peer pane, then call herdr_steer_agent to resume the original task.";
 	}
 	return undefined;
+}
+
+async function waitForSubmissionEcho(
+	adapter: HerdrAdapter,
+	paneId: string,
+	taskMarker: string,
+	options: PollOptions,
+): Promise<void> {
+	await pollUntil(async () => {
+		const read = await adapter.paneRead(paneId, 160, options.signal);
+		if (!read) throw new PaneMissingError();
+		return read.read.text.includes(`[herdr-task-marker:${taskMarker}]`) ? true : undefined;
+	}, options);
 }
 
 async function confirmPostSubmitStartup(
 	adapter: HerdrAdapter,
 	paneId: string,
 	prompt: string,
+	taskMarker: string,
 	options: PollOptions,
+	preSubmitStatus: AgentStatus = "idle",
 ): Promise<{ status: AgentStatus; seenWorking: boolean }> {
 	// Arm before pane run so Herdr observes a short working transition that a
 	// sampled pane-get loop could miss. The local controller always cancels the
 	// waiter when an immediate post-submit state already proves the outcome.
 	const linked = createLinkedAbortController(options.signal);
-	const transitionWait = waitForAnyAgentStatus(adapter, paneId, ["working", "blocked", "done"], {
+	// A pre-existing done state must not satisfy the new task's waiter. Require
+	// an observed working transition in that case; otherwise an old completion
+	// could be attributed to the follow-up.
+	const transitionStatuses: AgentStatus[] =
+		preSubmitStatus === "done" ? ["working", "blocked"] : ["working", "blocked", "done"];
+	const transitionWait = waitForAnyAgentStatus(adapter, paneId, transitionStatuses, {
 		...options,
 		signal: linked.controller.signal,
 	});
@@ -237,13 +262,19 @@ async function confirmPostSubmitStartup(
 		// prompt can trigger a very fast agent run.
 		await new Promise<void>((resolve) => setImmediate(resolve));
 		await adapter.paneRun(paneId, prompt, options.signal);
+		// A status transition can belong to CLI initialization rather than this
+		// task. Require the unique marker to appear in terminal output before
+		// treating working/done as acknowledgement of the assignment.
+		await waitForSubmissionEcho(adapter, paneId, taskMarker, options);
 
 		const info = await adapter.paneGet(paneId, options.signal);
 		if (!info) throw new PaneMissingError();
 		let status = info.pane.agent_status;
 
 		if (status === "blocked") return { status, seenWorking: false };
-		if (status === "done" || status === "working") return { status, seenWorking: true };
+		if (status === "working" || (status === "done" && preSubmitStatus !== "done")) {
+			return { status, seenWorking: true };
+		}
 
 		try {
 			status = await transitionWait;
@@ -256,7 +287,9 @@ async function confirmPostSubmitStartup(
 				const retry = await adapter.paneGet(paneId, options.signal);
 				if (!retry) throw new PaneMissingError();
 				status = retry.pane.agent_status;
-				if (status === "done") return { status, seenWorking: true };
+				if (status === "done" && preSubmitStatus !== "done") {
+					return { status, seenWorking: true };
+				}
 				if (status === "blocked") return { status, seenWorking: false };
 			}
 			throw error;
@@ -291,10 +324,12 @@ async function markLaunchFailure(
 	signal?: AbortSignal,
 ): Promise<LaunchResult> {
 	let live: Awaited<ReturnType<HerdrAdapter["paneGet"]>>;
+	let validationError: unknown;
 	try {
 		live = await deps.adapter.paneGet(record.identity.paneId, signal);
-	} catch {
+	} catch (lookupError) {
 		live = undefined;
+		validationError = lookupError;
 	}
 
 	let recordStatus: RecordStatus;
@@ -314,11 +349,15 @@ async function markLaunchFailure(
 	}
 	const liveStatus = live?.pane.agent_status ?? record.agentStatus;
 	if (liveStatus === "blocked") recordStatus = "blocked";
-	if (!live)
+	if (validationError && !signal?.aborted) {
+		recordStatus = "unavailable";
+		errorMessage = `${errorMessage}; unable to validate pane: ${validationError instanceof Error ? validationError.message : String(validationError)}`;
+	} else if (!live) {
 		recordStatus =
 			error instanceof PollTimeoutError || error instanceof PollAbortedError
 				? recordStatus
 				: "lost";
+	}
 
 	const updated =
 		deps.store.mutate(agentId, (current) => {
@@ -327,6 +366,7 @@ async function markLaunchFailure(
 			current.error = errorMessage;
 			if (liveStatus === "working") current.seenWorking = true;
 			if (!live && recordStatus === "lost") current.lost = true;
+			if (recordStatus === "unavailable") current.lost = false;
 		}) ?? record;
 	return buildPartialResult(updated, { error: errorMessage });
 }
@@ -362,8 +402,6 @@ export async function launchAgent(
 		throw new Error("description exceeds 200 characters");
 	}
 	if (params.workspace && params.tab) throw new Error("Cannot specify both workspace and tab");
-	const roleAssignment = buildRoleAssignment(roleName, role, params.prompt);
-	if (roleAssignment.length > 120_000) throw new Error("role assignment exceeds 120000 characters");
 
 	const cwd = resolveCwd(params.cwd, ctx.cwd);
 	let cwdIsDirectory = false;
@@ -391,49 +429,115 @@ export async function launchAgent(
 	const transcriptLines = boundedNumber(params.transcriptLines, DEFAULT_TRANSCRIPT_LINES, 1, 2000);
 
 	const agentId = generateAgentId();
+	const taskMarker = generateTaskMarker(agentId);
+	const roleAssignment = buildRoleAssignment(roleName, role, params.prompt, taskMarker);
+	if (roleAssignment.length > 120_000) throw new Error("role assignment exceeds 120000 characters");
 	const herdrName = makeHerdrAgentName(`${roleName}-${profileName}`, agentId);
 	const herdrCtx = env.context;
-	// Auto-layout only applies to same-workspace launches with no explicit split:
-	// an explicit split is a deliberate override, and a workspace launch lands in
-	// a tab the caller doesn't know ahead of time, so there is no grid to join.
-	const useAutoLayout = params.split === undefined && params.workspace === undefined;
-	const startResult = await deps.adapter.agentStart(
-		{
-			name: herdrName,
-			argv: [...profile.argv],
-			cwd,
-			workspaceId: params.workspace,
-			tabId: params.tab ?? (params.workspace ? undefined : herdrCtx.tabId),
-			// Auto-layout starts at a throwaway position; paneMove relocates it below.
-			split: params.split ?? "right",
-			focus: params.focus ?? false,
-			timeoutMs: startupTimeoutMs,
-		},
-		signal,
-	);
+	if (role.writeAccess === "workspace") {
+		const conflict = deps.store.reserveWriteLease(agentId, cwd);
+		if (conflict) {
+			throw new Error(
+				`Write-capable role "${roleName}" conflicts with active agent "${conflict}" in ${cwd}. Stop or complete it, or launch in a separate Git worktree.`,
+			);
+		}
+	}
+	deps.store.setPendingAssignment(agentId, roleAssignment);
 
-	// This is intentionally the first persistence point after Herdr returns an
-	// opaque pane identity. Every later failure can therefore be recovered.
-	//
-	// Everything from here through store.upsert() below is one synchronous
-	// stretch with no `await` in between. That is what makes layout-slot
-	// reservation race-free under concurrent launchAgent() calls: two calls
-	// can run agentStart concurrently, but each one's post-await continuation
-	// runs to completion (uninterrupted) before the other's continuation gets
-	// a turn, so reserveLayoutSlot's synchronous scan can never observe two
-	// launches mid-claim at once.
+	// Auto-layout only applies in the caller's current tab. An explicit tab can
+	// point elsewhere in the workspace, where the caller pane is not a valid anchor.
+	const useAutoLayout =
+		params.split === undefined &&
+		params.workspace === undefined &&
+		(params.tab === undefined || params.tab === herdrCtx.tabId);
+	let startResult: Awaited<ReturnType<HerdrAdapter["agentStart"]>>;
+	try {
+		startResult = await deps.adapter.agentStart(
+			{
+				name: herdrName,
+				argv: [...profile.argv],
+				cwd,
+				workspaceId: params.workspace,
+				tabId: params.tab ?? (params.workspace ? undefined : herdrCtx.tabId),
+				// Auto-layout starts at a throwaway position; paneMove relocates it below.
+				split: params.split ?? "right",
+				focus: params.focus ?? false,
+				timeoutMs: startupTimeoutMs,
+			},
+			signal,
+		);
+	} catch (startError) {
+		// agent start can time out or return malformed output after Herdr has
+		// already created the pane. Reconcile by the unique display name so the
+		// caller still receives an id that can be inspected or stopped.
+		let recovered: Awaited<ReturnType<HerdrAdapter["agentGet"]>>;
+		try {
+			recovered = await deps.adapter.agentGet(herdrName);
+		} catch {
+			recovered = undefined;
+		}
+		if (recovered) {
+			const expectedTab = params.tab ?? (params.workspace ? undefined : herdrCtx.tabId);
+			const recoveredCwd = recovered.agent.cwd
+				? resolveCwd(recovered.agent.cwd, recovered.agent.cwd)
+				: undefined;
+			if (
+				(recovered.agent.name !== undefined && recovered.agent.name !== herdrName) ||
+				(recoveredCwd !== undefined && recoveredCwd !== cwd) ||
+				(expectedTab !== undefined && recovered.agent.tab_id !== expectedTab) ||
+				(params.workspace !== undefined && recovered.agent.workspace_id !== params.workspace)
+			) {
+				recovered = undefined;
+			}
+		}
+		if (!recovered) {
+			deps.store.releaseWriteLease(agentId);
+			deps.store.clearPendingAssignment(agentId);
+			const message = startError instanceof Error ? startError.message : String(startError);
+			throw new Error(
+				`Agent ${agentId} (${herdrName}) failed to start and could not be reconciled: ${message}`,
+			);
+		}
+		const message = startError instanceof Error ? startError.message : String(startError);
+		const recoveredRecord = deps.store.upsert({
+			id: agentId,
+			role: roleName,
+			profile: profileName,
+			description: params.description?.trim() || `[${roleName}] peer agent`,
+			cwd,
+			writeAccess: role.writeAccess,
+			submissionState: "pending",
+			taskMarker,
+			herdrName,
+			identity: identityFromPane(recovered.agent),
+			agentStatus: recovered.agent.agent_status,
+			recordStatus: signal?.aborted ? "aborted" : "error",
+			seenWorking: false,
+			mode,
+			launchedAt: Date.now(),
+			error: `agent start failed after pane creation: ${message}`,
+			owned: true,
+			stopped: false,
+			lost: false,
+		});
+		return buildPartialResult(recoveredRecord, { error: recoveredRecord.error });
+	}
+
+	// Everything from here through store.upsert() is one synchronous stretch;
+	// this keeps layout-slot reservation race-free under concurrent launches.
 	const identity = identityFromPane(startResult.agent);
-	const layoutTabId = useAutoLayout ? (params.tab ?? herdrCtx.tabId) : undefined;
+	const layoutTabId = useAutoLayout ? herdrCtx.tabId : undefined;
 	const layoutSlot =
 		useAutoLayout && layoutTabId ? deps.store.reserveLayoutSlot(layoutTabId) : undefined;
 	let record = deps.store.upsert({
 		id: agentId,
 		role: roleName,
 		profile: profileName,
-		description:
-			params.description?.trim() || `[${roleName}] ${params.prompt.trim().slice(0, 110)}`,
-		prompt: params.prompt,
+		description: params.description?.trim() || `[${roleName}] peer agent`,
 		cwd,
+		writeAccess: role.writeAccess,
+		submissionState: "pending",
+		taskMarker,
 		herdrName,
 		identity,
 		agentStatus: startResult.agent.agent_status,
@@ -517,10 +621,15 @@ export async function launchAgent(
 
 		// pane run receives the entire prompt as one argv element; no shell
 		// interpolation or command-string construction occurs here.
+		record =
+			deps.store.mutate(agentId, (current) => {
+				current.submissionState = "submitted";
+			}) ?? record;
 		const startup = await confirmPostSubmitStartup(
 			deps.adapter,
 			identity.paneId,
 			roleAssignment,
+			taskMarker,
 			pollBase,
 		);
 		status = startup.status;
@@ -528,7 +637,9 @@ export async function launchAgent(
 			deps.store.mutate(agentId, (current) => {
 				Object.assign(current, updateRecordFromPane(current, status, { promptSubmitted: true }));
 				if (startup.seenWorking) current.seenWorking = true;
+				current.submissionState = "acknowledged";
 			}) ?? record;
+		deps.store.clearPendingAssignment(agentId);
 		if (status === "blocked") {
 			record =
 				deps.store.mutate(agentId, (current) => {
@@ -602,6 +713,8 @@ export async function launchAgent(
 			partial: false,
 		};
 	} catch (error) {
+		// Once paneRun has been attempted, keep submissionState=submitted on
+		// uncertainty. Automatically retrying could execute the same task twice.
 		return markLaunchFailure(deps, agentId, record, error, signal);
 	}
 }
@@ -613,11 +726,25 @@ async function refreshRecord(
 ): Promise<AgentRecord> {
 	const latest = deps.store.get(agentId);
 	if (!latest) throw new Error(`Unknown agent id "${agentId}"`);
-	const validated = await validateLiveRecord(deps.adapter, latest, signal);
+	let validated: AgentRecord;
+	try {
+		validated = await validateLiveRecord(deps.adapter, latest, signal);
+	} catch (error) {
+		return (
+			deps.store.mutate(agentId, (record) => {
+				record.recordStatus = "unavailable";
+				record.error = `Unable to refresh pane: ${error instanceof Error ? error.message : String(error)}`;
+			}) ?? latest
+		);
+	}
 	if (validated.lost) return deps.store.upsert(validated);
 	return (
 		deps.store.mutate(agentId, (record) => {
 			Object.assign(record, updateRecordFromPane(record, validated.agentStatus));
+			if (latest.recordStatus === "unavailable") record.error = undefined;
+			if (!record.completedAt && isCompletionStatus(record.agentStatus, record.seenWorking)) {
+				record.completedAt = Date.now();
+			}
 		}) ?? validated
 	);
 }
@@ -641,7 +768,7 @@ export async function getAgentResult(
 	): Promise<AgentResult> => {
 		const complete = isCompletionStatus(record.agentStatus, record.seenWorking);
 		const read =
-			includeTranscript && !record.lost && !record.stopped
+			includeTranscript && !record.lost && !record.stopped && record.recordStatus !== "unavailable"
 				? await readTranscript(deps.adapter, record.identity.paneId, transcriptLines, signal)
 				: undefined;
 		return {
@@ -697,7 +824,7 @@ export async function getAgentResult(
 
 export async function steerAgent(
 	deps: LifecycleDeps,
-	params: { agentId: string; message: string },
+	params: { agentId: string; message: string; forceResubmit?: boolean },
 	signal?: AbortSignal,
 ): Promise<AgentRecord> {
 	if (!params.message || !params.message.trim()) throw new Error("message is required");
@@ -712,12 +839,158 @@ export async function steerAgent(
 		deps.store.upsert(validated);
 		throw new Error(`Agent "${params.agentId}" pane is no longer available`);
 	}
+
+	if (record.submissionState === "submitted" && !params.forceResubmit) {
+		throw new Error(
+			`Agent "${params.agentId}" has an unacknowledged initial assignment. Inspect it first; set force_resubmit only if duplicating possible work is acceptable.`,
+		);
+	}
+	const submitInitial =
+		record.submissionState === "pending" ||
+		(record.submissionState === "submitted" && params.forceResubmit === true);
+	if (submitInitial) {
+		if (validated.agentStatus === "blocked") {
+			throw new Error(
+				`Agent "${params.agentId}" is still blocked; clear the prompt in its pane before steering it`,
+			);
+		}
+		const roles = deps.resolveRoles();
+		const roleName = record.role ?? "general";
+		const role = roles[roleName];
+		if (!role) throw new Error(`Role "${roleName}" is no longer configured`);
+		const isForcedReplacement = record.submissionState === "submitted";
+		const taskMarker = isForcedReplacement
+			? generateTaskMarker(record.id)
+			: (record.taskMarker ?? generateTaskMarker(record.id));
+		// In the original session, resume the exact cached assignment. After a
+		// restore—or for an explicit forced replacement—the steer message is
+		// wrapped as a new task with the same role.
+		const cachedAssignment = deps.store.getPendingAssignment(record.id);
+		const assignment =
+			!isForcedReplacement && cachedAssignment
+				? cachedAssignment
+				: buildRoleAssignment(roleName, role, params.message, taskMarker);
+		const options: PollOptions = {
+			signal,
+			pollIntervalMs: DEFAULT_POLL_INTERVAL_MS,
+			timeoutMs: DEFAULT_STARTUP_TIMEOUT_MS,
+		};
+		const readyStatus = await waitForStartupIdle(deps.adapter, validated.identity.paneId, options);
+		if (readyStatus === "blocked") {
+			throw new Error(`Agent "${params.agentId}" became blocked again before task submission`);
+		}
+		const startupScreen = await waitForPaneReady(deps.adapter, validated.identity.paneId, options);
+		const startupBlocker = detectStartupBlocker(record.profile, startupScreen);
+		if (startupBlocker) throw new Error(startupBlocker);
+		deps.store.mutate(record.id, (current) => {
+			current.submissionState = "submitted";
+			current.taskMarker = taskMarker;
+		});
+		const startup = await confirmPostSubmitStartup(
+			deps.adapter,
+			validated.identity.paneId,
+			assignment,
+			taskMarker,
+			options,
+			readyStatus,
+		);
+		const updated =
+			deps.store.mutate(record.id, (current) => {
+				Object.assign(
+					current,
+					updateRecordFromPane(current, startup.status, { promptSubmitted: true }),
+				);
+				if (startup.seenWorking) current.seenWorking = true;
+				current.submissionState = "acknowledged";
+				current.error =
+					startup.status === "blocked" ? "Agent became blocked after task submission" : undefined;
+			}) ?? validated;
+		deps.store.clearPendingAssignment(record.id);
+		return updated;
+	}
+
+	// Steering a completed writer begins a new turn. Reacquire the synchronous
+	// workspace lease and reset completion before paneRun so another writer
+	// cannot launch in the handoff window.
+	if (isCompletionStatus(validated.agentStatus, record.seenWorking)) {
+		const taskMarker = generateTaskMarker(record.id);
+		if ((record.writeAccess ?? "workspace") === "workspace") {
+			const conflict = deps.store.reserveWriteLease(record.id, record.cwd);
+			if (conflict) {
+				throw new Error(
+					`Write-capable agent "${record.id}" conflicts with active agent "${conflict}" in ${record.cwd}`,
+				);
+			}
+		}
+		try {
+			deps.store.mutate(record.id, (current) => {
+				current.agentStatus = "unknown";
+				current.recordStatus = "starting";
+				current.seenWorking = false;
+				current.completedAt = undefined;
+				current.taskMarker = taskMarker;
+				current.error = undefined;
+			});
+		} finally {
+			deps.store.releaseWriteLease(record.id);
+		}
+		const followUp = `${params.message}\n\n[herdr-task-marker:${taskMarker}]`;
+		const options: PollOptions = {
+			signal,
+			pollIntervalMs: DEFAULT_POLL_INTERVAL_MS,
+			timeoutMs: DEFAULT_STARTUP_TIMEOUT_MS,
+		};
+		try {
+			const startup = await confirmPostSubmitStartup(
+				deps.adapter,
+				validated.identity.paneId,
+				followUp,
+				taskMarker,
+				options,
+				validated.agentStatus,
+			);
+			return (
+				deps.store.mutate(record.id, (current) => {
+					Object.assign(
+						current,
+						updateRecordFromPane(current, startup.status, { promptSubmitted: true }),
+					);
+					if (startup.seenWorking) current.seenWorking = true;
+					if (isCompletionStatus(current.agentStatus, current.seenWorking)) {
+						current.completedAt = Date.now();
+					}
+				}) ?? validated
+			);
+		} catch (error) {
+			deps.store.mutate(record.id, (current) => {
+				current.recordStatus =
+					error instanceof PollTimeoutError
+						? "timeout"
+						: error instanceof PollAbortedError
+							? "aborted"
+							: "error";
+				current.error = error instanceof Error ? error.message : String(error);
+			});
+			throw error;
+		}
+	}
+
 	await deps.adapter.paneRun(validated.identity.paneId, params.message, signal);
 	return (
 		deps.store.mutate(params.agentId, (current) => {
 			Object.assign(current, updateRecordFromPane(current, validated.agentStatus));
 		}) ?? validated
 	);
+}
+
+export function listAgents(
+	deps: LifecycleDeps,
+	options: { includeStopped?: boolean } = {},
+): AgentRecord[] {
+	return deps.store
+		.list()
+		.filter((record) => options.includeStopped !== false || !record.stopped)
+		.sort((left, right) => right.launchedAt - left.launchedAt);
 }
 
 export async function stopAgent(
@@ -731,11 +1004,13 @@ export async function stopAgent(
 	if (record.stopped) return record;
 	const validated = await validateLiveRecord(deps.adapter, record, signal);
 	if (validated.lost) {
+		deps.store.clearPendingAssignment(params.agentId);
 		return deps.store.upsert({ ...validated, lost: true, recordStatus: "lost" });
 	}
 	// validateLiveRecord compares pane, terminal, workspace, and tab before this
 	// irreversible operation. Never close based on a stale or partial identity.
 	await deps.adapter.paneClose(validated.identity.paneId, signal);
+	deps.store.clearPendingAssignment(params.agentId);
 	return (
 		deps.store.mutate(params.agentId, (current) => {
 			current.stopped = true;

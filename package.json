@@ -8,7 +8,7 @@
 	"pi": {
 		"extensions": ["./src/index.ts"]
 	},
-	"files": ["src", "README.md", "LICENSE"],
+	"files": ["src", "docs/PRD.md", "README.md", "LICENSE"],
 	"scripts": {
 		"typecheck": "tsc --noEmit",
 		"lint": "biome check .",

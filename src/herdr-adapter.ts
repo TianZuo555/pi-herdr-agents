@@ -1,5 +1,6 @@
 import { PollAbortedError, PollTimeoutError } from "./poll.js";
 import type {
+	AgentInfoResult,
 	AgentStartOptions,
 	AgentStartedResult,
 	AgentStatus,
@@ -107,6 +108,18 @@ export function validateAgentStarted(result: unknown): AgentStartedResult {
 		throw new Error("agent start: argv must be a string array");
 	}
 	return object as unknown as AgentStartedResult;
+}
+
+export function validateAgentInfo(result: unknown): AgentInfoResult {
+	if (result === null || typeof result !== "object") {
+		throw new Error("agent get: invalid result object");
+	}
+	const object = result as Record<string, unknown>;
+	if (object.type !== "agent_info") {
+		throw new Error(`agent get: expected type agent_info, got ${String(object.type)}`);
+	}
+	validatePane(object.agent, "agent get");
+	return object as unknown as AgentInfoResult;
 }
 
 export function validatePaneInfo(result: unknown): PaneInfoResult {
@@ -297,6 +310,17 @@ export function createHerdrAdapter(exec: ExecFn): import("./types.js").HerdrAdap
 			return validateAgentStarted(
 				assertEnvelope(parseHerdrEnvelope<unknown>(stdout), "agent start"),
 			);
+		},
+
+		async agentGet(target, signal) {
+			try {
+				const stdout = await runHerdr(["agent", "get", target], signal, "agent get");
+				return validateAgentInfo(assertEnvelope(parseHerdrEnvelope<unknown>(stdout), "agent get"));
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				if (message.includes("not found") || message.includes("unknown agent")) return undefined;
+				throw error;
+			}
 		},
 
 		async paneGet(paneId, signal) {

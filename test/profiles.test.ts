@@ -61,6 +61,25 @@ describe("profiles", () => {
 		expect(BUILTIN_PROFILES.agy.argv).toEqual(["agy"]);
 	});
 
+	it("defaults custom roles to conservative workspace write access", () => {
+		const parsed = parseProfilesConfig(
+			{
+				roles: {
+					custom: { profile: "pi", description: "Custom", prompt: "Do work." },
+					readonly: {
+						profile: "pi",
+						description: "Read only",
+						prompt: "Inspect only.",
+						writeAccess: "none",
+					},
+				},
+			},
+			"test",
+		);
+		expect(parsed.roles.custom.writeAccess).toBe("workspace");
+		expect(parsed.roles.readonly.writeAccess).toBe("none");
+	});
+
 	it("loadProfilesFile returns undefined for missing file", () => {
 		expect(loadProfilesFile("/nonexistent/herdr-agents.json")).toBeUndefined();
 	});

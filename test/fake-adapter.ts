@@ -12,6 +12,8 @@ import type {
 
 export interface FakePaneState {
 	paneId: string;
+	name?: string;
+	cwd?: string;
 	terminalId: string;
 	workspaceId: string;
 	tabId: string;
@@ -86,6 +88,8 @@ export class FakeHerdrAdapter implements HerdrAdapter {
 		const paneId = `w1:p${this.counter}`;
 		const pane: FakePaneState = {
 			paneId,
+			name: options.name,
+			cwd: options.cwd,
 			terminalId: `term_${this.counter}`,
 			workspaceId: options.workspaceId ?? "w1",
 			tabId: options.tabId ?? "w1:t1",
@@ -103,6 +107,27 @@ export class FakeHerdrAdapter implements HerdrAdapter {
 				agent_status: pane.agentStatus,
 			},
 			argv: options.argv,
+		};
+	}
+
+	async agentGet(target: string) {
+		this.calls.push({ method: "agentGet", args: [target] });
+		const pane = [...this.panes.values()].find(
+			(candidate) =>
+				!candidate.closed && (candidate.name === target || candidate.paneId === target),
+		);
+		if (!pane) return undefined;
+		return {
+			type: "agent_info" as const,
+			agent: {
+				pane_id: pane.paneId,
+				terminal_id: pane.terminalId,
+				workspace_id: pane.workspaceId,
+				tab_id: pane.tabId,
+				agent_status: pane.agentStatus,
+				name: pane.name,
+				cwd: pane.cwd,
+			},
 		};
 	}
 
@@ -139,8 +164,10 @@ export class FakeHerdrAdapter implements HerdrAdapter {
 		if (!pane || pane.closed) throw new Error(`pane not found: ${paneId}`);
 		if (pane.onRun) {
 			pane.onRun(text);
+			pane.transcript = pane.transcript ? `${pane.transcript}\n${text}` : text;
 			return;
 		}
+		pane.transcript = pane.transcript ? `${pane.transcript}\n${text}` : text;
 		if (pane.agentStatus === "idle") {
 			pane.agentStatus = "working";
 			this.resolveStatusWaiters(paneId, "working");

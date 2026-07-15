@@ -130,10 +130,15 @@ export function parseProfilesConfig(raw: unknown, source: string): ProfilesConfi
 		) {
 			throw new Error(`${source}: role "${name}" prompt must be 1-20000 safe characters`);
 		}
+		const writeAccess = roleObj.writeAccess ?? "workspace";
+		if (writeAccess !== "none" && writeAccess !== "workspace") {
+			throw new Error(`${source}: role "${name}" writeAccess must be "none" or "workspace"`);
+		}
 		roles[name] = {
 			profile: roleObj.profile,
 			description: roleObj.description.trim(),
 			prompt: roleObj.prompt.trim(),
+			writeAccess,
 		};
 	}
 

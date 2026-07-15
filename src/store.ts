@@ -1,8 +1,26 @@
+import { isDeepStrictEqual } from "node:util";
 import type { HerdrAdapter } from "./types.js";
 import type { AgentRecord, SnapshotV1 } from "./types.js";
-import { SNAPSHOT_CUSTOM_TYPE, SNAPSHOT_VERSION, identitiesMatch } from "./types.js";
+import {
+	SNAPSHOT_CUSTOM_TYPE,
+	SNAPSHOT_VERSION,
+	identitiesMatch,
+	isCompletionStatus,
+} from "./types.js";
 
 type AppendEntryHandler = (customType: string, data?: unknown) => void;
+
+const BUILTIN_READ_ONLY_ROLES = new Set(["scout", "planner", "reviewer", "researcher"]);
+
+function inferLegacyWriteAccess(record: AgentRecord): "none" | "workspace" {
+	return record.role && BUILTIN_READ_ONLY_ROLES.has(record.role) ? "none" : "workspace";
+}
+
+function inferLegacySubmissionState(record: AgentRecord): AgentRecord["submissionState"] {
+	if (record.seenWorking || record.agentStatus === "working") return "acknowledged";
+	if (["launching", "starting", "blocked"].includes(record.recordStatus)) return "pending";
+	return "submitted";
+}
 
 function isAgentRecord(value: unknown): value is AgentRecord {
 	if (!value || typeof value !== "object") return false;
@@ -14,8 +32,15 @@ function isAgentRecord(value: unknown): value is AgentRecord {
 		typeof record.id === "string" &&
 		(record.role === undefined || typeof record.role === "string") &&
 		typeof record.profile === "string" &&
-		typeof record.prompt === "string" &&
+		(record.prompt === undefined || typeof record.prompt === "string") &&
 		typeof record.cwd === "string" &&
+		(record.writeAccess === undefined ||
+			record.writeAccess === "none" ||
+			record.writeAccess === "workspace") &&
+		(record.submissionState === undefined ||
+			record.submissionState === "pending" ||
+			record.submissionState === "submitted" ||
+			record.submissionState === "acknowledged") &&
 		typeof identityObject.paneId === "string" &&
 		typeof identityObject.terminalId === "string" &&
 		typeof identityObject.workspaceId === "string" &&
@@ -40,6 +65,8 @@ function isSnapshot(value: unknown): value is SnapshotV1 {
 export class AgentStore {
 	private records = new Map<string, AgentRecord>();
 	private appendEntry?: AppendEntryHandler;
+	private pendingAssignments = new Map<string, string>();
+	private writeReservations = new Map<string, string>();
 
 	setAppendEntry(handler: AppendEntryHandler): void {
 		this.appendEntry = handler;
@@ -47,8 +74,18 @@ export class AgentStore {
 
 	loadSnapshot(snapshot: SnapshotV1): void {
 		this.records.clear();
+		this.pendingAssignments.clear();
+		this.writeReservations.clear();
 		for (const record of snapshot.records) {
-			if (isAgentRecord(record)) this.records.set(record.id, structuredClone(record));
+			if (!isAgentRecord(record)) continue;
+			const copy = structuredClone(record);
+			// Prompt text from legacy snapshots is deliberately discarded. The
+			// session already contains the original tool call; fleet snapshots only
+			// retain operational metadata.
+			copy.prompt = undefined;
+			copy.writeAccess ??= inferLegacyWriteAccess(copy);
+			copy.submissionState ??= inferLegacySubmissionState(copy);
+			this.records.set(copy.id, copy);
 		}
 	}
 
@@ -62,7 +99,7 @@ export class AgentStore {
 			latest = structuredClone(entry.data);
 		}
 		if (latest) this.loadSnapshot(latest);
-		else this.records.clear();
+		else this.clear();
 		return latest;
 	}
 
@@ -77,8 +114,11 @@ export class AgentStore {
 
 	upsert(record: AgentRecord): AgentRecord {
 		const copy = structuredClone(record);
+		copy.prompt = undefined;
+		const existing = this.records.get(copy.id);
 		this.records.set(copy.id, copy);
-		this.persist();
+		this.writeReservations.delete(copy.id);
+		if (!existing || !isDeepStrictEqual(existing, copy)) this.persist();
 		return structuredClone(copy);
 	}
 
@@ -87,16 +127,48 @@ export class AgentStore {
 		if (!existing) return undefined;
 		const copy = structuredClone(existing);
 		update(copy);
+		copy.prompt = undefined;
+		if (isDeepStrictEqual(existing, copy)) return structuredClone(existing);
 		this.records.set(id, copy);
 		this.persist();
 		return structuredClone(copy);
 	}
 
+	/** Atomically reserve a workspace write lease before agentStart awaits. */
+	reserveWriteLease(agentId: string, cwd: string): string | undefined {
+		for (const [reservedId, reservedCwd] of this.writeReservations) {
+			if (reservedId !== agentId && reservedCwd === cwd) return reservedId;
+		}
+		for (const record of this.records.values()) {
+			if (record.id === agentId || record.cwd !== cwd) continue;
+			if ((record.writeAccess ?? "workspace") !== "workspace") continue;
+			if (record.stopped || record.lost) continue;
+			if (isCompletionStatus(record.agentStatus, record.seenWorking)) continue;
+			return record.id;
+		}
+		this.writeReservations.set(agentId, cwd);
+		return undefined;
+	}
+
+	releaseWriteLease(agentId: string): void {
+		this.writeReservations.delete(agentId);
+	}
+
+	setPendingAssignment(agentId: string, assignment: string): void {
+		this.pendingAssignments.set(agentId, assignment);
+	}
+
+	getPendingAssignment(agentId: string): string | undefined {
+		return this.pendingAssignments.get(agentId);
+	}
+
+	clearPendingAssignment(agentId: string): void {
+		this.pendingAssignments.delete(agentId);
+	}
+
 	/**
 	 * Next free column-fill layout slot for a tab. Callers must claim the
-	 * returned value via upsert() with zero `await` in between: this method
-	 * only reads the current occupancy, so its safety against concurrent
-	 * launches depends on that synchronous read-then-claim discipline.
+	 * returned value via upsert() with zero `await` in between.
 	 */
 	reserveLayoutSlot(tabId: string): number {
 		let max = 0;
@@ -118,6 +190,8 @@ export class AgentStore {
 
 	clear(): void {
 		this.records.clear();
+		this.pendingAssignments.clear();
+		this.writeReservations.clear();
 	}
 
 	toSnapshot(): SnapshotV1 {
@@ -155,11 +229,23 @@ export async function validateLiveRecord(
 	}
 
 	const liveStatus = paneInfo.pane.agent_status;
-	return {
-		...structuredClone(record),
-		agentStatus: liveStatus,
-		seenWorking: record.seenWorking || liveStatus === "working",
-	};
+	const seenWorking = record.seenWorking || liveStatus === "working";
+	const recordStatus =
+		liveStatus === "working"
+			? "working"
+			: liveStatus === "blocked"
+				? "blocked"
+				: isCompletionStatus(liveStatus, seenWorking)
+					? liveStatus
+					: liveStatus === "unknown"
+						? "unknown"
+						: "starting";
+	const validated = structuredClone(record);
+	validated.agentStatus = liveStatus;
+	validated.recordStatus = recordStatus;
+	validated.seenWorking = seenWorking;
+	if (record.recordStatus === "unavailable") validated.error = undefined;
+	return validated;
 }
 
 export async function restoreAndValidateRecords(
@@ -178,14 +264,17 @@ export async function restoreAndValidateRecords(
 			const live = await validateLiveRecord(adapter, record, signal);
 			validated.push(live);
 		} catch (error) {
+			if (signal?.aborted) throw error;
 			validated.push({
 				...record,
-				lost: true,
-				recordStatus: "lost",
+				lost: false,
+				recordStatus: "unavailable",
 				error: `Unable to validate restored pane: ${error instanceof Error ? error.message : String(error)}`,
 			});
 		}
 	}
-	store.loadSnapshot({ version: SNAPSHOT_VERSION, records: validated });
+	const next: SnapshotV1 = { version: SNAPSHOT_VERSION, records: validated };
+	if (isDeepStrictEqual(snapshot, next)) return;
+	store.loadSnapshot(next);
 	store.persist();
 }

@@ -8,6 +8,7 @@ import {
 	type LifecycleDeps,
 	getAgentResult,
 	launchAgent,
+	listAgents,
 	steerAgent,
 	stopAgent,
 } from "./lifecycle.js";
@@ -115,6 +116,12 @@ const ResultParamsSchema = Type.Object({
 	poll_interval_ms: Type.Optional(Type.Integer({ minimum: 50, maximum: 60_000 })),
 });
 
+const ListParamsSchema = Type.Object({
+	include_stopped: Type.Optional(
+		Type.Boolean({ description: "Include agents that were already stopped (default true)" }),
+	),
+});
+
 const SteerParamsSchema = Type.Object({
 	agent_id: Type.String({ description: "Tracked extension agent id" }),
 	message: Type.String({
@@ -122,6 +129,12 @@ const SteerParamsSchema = Type.Object({
 		maxLength: 100_000,
 		description: "Follow-up prompt sent via herdr pane run",
 	}),
+	force_resubmit: Type.Optional(
+		Type.Boolean({
+			description:
+				"Explicitly replace an unacknowledged initial assignment; may duplicate work if the peer accepted it without echoing the marker",
+		}),
+	),
 });
 
 const StopParamsSchema = Type.Object({
@@ -293,17 +306,47 @@ export function createHerdrAgentTools(host: ToolHost): ToolDefinition[] {
 			},
 		}),
 		defineTool({
+			name: "herdr_list_agents",
+			label: "Herdr List Agents",
+			description:
+				"List tracked Herdr peer agents with lifecycle, submission, write-access, and pane metadata. Use this to recover an agent id or inspect the fleet.",
+			promptSnippet: "List tracked Herdr peer agents",
+			parameters: ListParamsSchema,
+			async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+				const records = listAgents(makeDeps(host, ctx), {
+					includeStopped: params.include_stopped,
+				});
+				const text =
+					records.length === 0
+						? "No tracked Herdr peer agents."
+						: records
+								.map(
+									(record) =>
+										`${record.id} role=${record.role ?? "general"} profile=${record.profile} status=${record.recordStatus}/${record.agentStatus} submission=${record.submissionState ?? "legacy"} write=${record.writeAccess ?? "workspace"} pane=${record.identity.paneId} cwd=${record.cwd}${record.error ? ` error=${record.error}` : ""}`,
+								)
+								.join("\n");
+				return {
+					content: [{ type: "text", text }],
+					details: { records },
+				};
+			},
+		}),
+		defineTool({
 			name: "herdr_steer_agent",
 			label: "Herdr Steer Agent",
 			description:
-				"Send a follow-up prompt to a tracked Herdr peer agent via pane run. Only works for live agents launched by this extension.",
+				"Send a follow-up prompt to a tracked Herdr peer agent. If its initial assignment is still pending after a startup blocker, this safely resubmits the original role-wrapped assignment (or uses the message as a replacement after session restore).",
 			promptSnippet: "Redirect or clarify a live Herdr peer agent",
 			parameters: SteerParamsSchema,
 			async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 				const deps = makeDeps(host, ctx);
 				const record = await steerAgent(
 					deps,
-					{ agentId: params.agent_id, message: params.message },
+					{
+						agentId: params.agent_id,
+						message: params.message,
+						forceResubmit: params.force_resubmit,
+					},
 					signal,
 				);
 				return {

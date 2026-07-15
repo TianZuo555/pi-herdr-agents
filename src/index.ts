@@ -53,5 +53,5 @@ export {
 	buildRoleAssignment,
 	HERDR_PARENT_SYSTEM_PROMPT,
 } from "./roles.js";
-export { launchAgent, getAgentResult, steerAgent, stopAgent } from "./lifecycle.js";
+export { launchAgent, getAgentResult, listAgents, steerAgent, stopAgent } from "./lifecycle.js";
 export type * from "./types.js";

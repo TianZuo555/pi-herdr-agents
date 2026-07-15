@@ -6,6 +6,7 @@ import {
 	getAgentResult,
 	isValidCompletion,
 	launchAgent,
+	listAgents,
 	steerAgent,
 	stopAgent,
 } from "../src/lifecycle.js";
@@ -237,6 +238,61 @@ describe("lifecycle", () => {
 		expect(adapter.calls.some((call) => call.method === "agentStart")).toBe(false);
 	});
 
+	it("keeps an unacknowledged submission from being retried implicitly", async () => {
+		const deps = makeDeps(adapter, store);
+		const realRead = adapter.paneRead.bind(adapter);
+		const realRun = adapter.paneRun.bind(adapter);
+		let submitted = false;
+		adapter.paneRun = async (paneId, text) => {
+			submitted = true;
+			await realRun(paneId, text);
+		};
+		adapter.paneRead = async (paneId, lines) => {
+			const result = await realRead(paneId, lines);
+			if (!result || !submitted) return result;
+			return {
+				...result,
+				read: {
+					...result.read,
+					text: result.read.text.replace(/\[herdr-task-marker:[^\]]+\]/g, ""),
+				},
+			};
+		};
+		const launchPromise = launchAgent(
+			deps,
+			{ cwd },
+			{
+				role: "scout",
+				profile: "pi",
+				prompt: "uncertain delivery",
+				mode: "background",
+				startupTimeoutMs: 20,
+			},
+			undefined,
+			{ sleep: noSleep, pollIntervalMs: 1 },
+		);
+		await vi.waitFor(() => adapter.getPane("w1:p1"));
+		adapter.setStatus("w1:p1", "idle");
+		const result = await launchPromise;
+		expect(result.status).toBe("timeout");
+		expect(store.get(result.agentId)?.submissionState).toBe("submitted");
+		await expect(
+			steerAgent(deps, { agentId: result.agentId, message: "do not duplicate" }),
+		).rejects.toThrow(/force_resubmit/);
+
+		const oldMarker = store.get(result.agentId)?.taskMarker;
+		adapter.paneRead = realRead;
+		adapter.paneRun = realRun;
+		adapter.setStatus("w1:p1", "idle");
+		const forced = await steerAgent(deps, {
+			agentId: result.agentId,
+			message: "explicit replacement",
+			forceResubmit: true,
+		});
+		expect(forced.submissionState).toBe("acknowledged");
+		expect(forced.taskMarker).not.toBe(oldMarker);
+	});
+
 	it("timeout preserves agent id and record", async () => {
 		const deps = makeDeps(adapter, store);
 		const result = await launchAgent(
@@ -249,6 +305,28 @@ describe("lifecycle", () => {
 		expect(result.partial).toBe(true);
 		expect(result.agentId).toBeTruthy();
 		expect(store.get(result.agentId)).toBeDefined();
+	});
+
+	it("keeps launch failures retryable when pane validation transport fails", async () => {
+		const deps = makeDeps(adapter, store);
+		adapter.paneGet = async () => {
+			throw new Error("Herdr socket unavailable");
+		};
+		const result = await launchAgent(
+			deps,
+			{ cwd },
+			{
+				role: "scout",
+				profile: "pi",
+				prompt: "transport failure",
+				mode: "background",
+				startupTimeoutMs: 10,
+			},
+			undefined,
+			{ sleep: noSleep, pollIntervalMs: 1 },
+		);
+		expect(result.status).toBe("unavailable");
+		expect(store.get(result.agentId)?.lost).toBe(false);
 	});
 
 	it("blocked status returns partial result immediately", async () => {
@@ -300,6 +378,51 @@ describe("lifecycle", () => {
 		expect(waited.transcript).toContain("done output");
 	});
 
+	it("resumes a blocked initial assignment with its original role wrapper", async () => {
+		const deps = makeDeps(adapter, store);
+		const launchPromise = launchAgent(
+			deps,
+			{ cwd },
+			{
+				role: "reviewer",
+				profile: "pi",
+				prompt: "Review the original task",
+				mode: "background",
+				startupTimeoutMs: 5000,
+			},
+			undefined,
+			{ sleep: noSleep, pollIntervalMs: 1 },
+		);
+		await vi.waitFor(() => adapter.getPane("w1:p1"));
+		adapter.setTranscript("w1:p1", "Trust this workspace");
+		adapter.setStatus("w1:p1", "blocked");
+		const blocked = await launchPromise;
+		expect(blocked.status).toBe("blocked");
+		expect(store.get(blocked.agentId)?.submissionState).toBe("pending");
+
+		adapter.setTranscript("w1:p1", "agent ready");
+		adapter.setStatus("w1:p1", "idle");
+		const pane = adapter.getPane("w1:p1");
+		if (!pane) throw new Error("expected pane");
+		pane.onRun = () => {
+			adapter.setStatus("w1:p1", "working");
+			adapter.setStatus("w1:p1", "done");
+			pane.transcript = "review complete";
+		};
+
+		const resumed = await steerAgent(deps, {
+			agentId: blocked.agentId,
+			message: "resume now",
+		});
+		const run = adapter.calls.filter((call) => call.method === "paneRun").at(-1);
+		expect(run?.args[1]).toContain('<herdr-peer-role name="reviewer">');
+		expect(run?.args[1]).toContain("Review the original task");
+		expect(run?.args[1]).not.toContain("resume now");
+		expect(resumed.submissionState).toBe("acknowledged");
+		expect(resumed.seenWorking).toBe(true);
+		expect(resumed.agentStatus).toBe("done");
+	});
+
 	it("steering uses pane run and persists", async () => {
 		const deps = makeDeps(adapter, store);
 		const launchPromise = launchAgent(
@@ -345,6 +468,110 @@ describe("lifecycle", () => {
 		).rejects.toThrow(/NUL bytes/);
 	});
 
+	it("serializes workspace writers while allowing read-only peers", async () => {
+		const deps = makeDeps(adapter, store);
+		const firstPromise = launchAgent(
+			deps,
+			{ cwd },
+			{
+				role: "executor",
+				profile: "pi",
+				prompt: "write one",
+				mode: "background",
+				startupTimeoutMs: 5000,
+			},
+			undefined,
+			{ sleep: noSleep, pollIntervalMs: 1 },
+		);
+		await vi.waitFor(() => adapter.getPane("w1:p1"));
+		adapter.setStatus("w1:p1", "idle");
+		const first = await firstPromise;
+		expect(first.seenWorking).toBe(true);
+
+		await expect(
+			launchAgent(
+				deps,
+				{ cwd },
+				{
+					role: "executor",
+					profile: "pi",
+					prompt: "write two",
+				},
+			),
+		).rejects.toThrow(/conflicts with active agent/);
+		expect(adapter.calls.filter((call) => call.method === "agentStart")).toHaveLength(1);
+
+		const scoutPromise = launchAgent(
+			deps,
+			{ cwd },
+			{
+				role: "scout",
+				profile: "pi",
+				prompt: "read only",
+				mode: "background",
+				startupTimeoutMs: 5000,
+			},
+			undefined,
+			{ sleep: noSleep, pollIntervalMs: 1 },
+		);
+		await vi.waitFor(() => adapter.getPane("w1:p2"));
+		adapter.setStatus("w1:p2", "idle");
+		const scout = await scoutPromise;
+		expect(scout.seenWorking).toBe(true);
+
+		await stopAgent(deps, { agentId: first.agentId });
+		expect(listAgents(deps, { includeStopped: false }).map((record) => record.id)).not.toContain(
+			first.agentId,
+		);
+	});
+
+	it("reacquires a writer lease when steering a completed writer", async () => {
+		const deps = makeDeps(adapter, store);
+		const launchPromise = launchAgent(
+			deps,
+			{ cwd },
+			{
+				role: "executor",
+				profile: "pi",
+				prompt: "first write",
+				mode: "background",
+				startupTimeoutMs: 5000,
+			},
+			undefined,
+			{ sleep: noSleep, pollIntervalMs: 1 },
+		);
+		await vi.waitFor(() => adapter.getPane("w1:p1"));
+		adapter.setStatus("w1:p1", "idle");
+		const launched = await launchPromise;
+		adapter.setStatus("w1:p1", "done");
+		await getAgentResult(deps, { agentId: launched.agentId, mode: "poll" });
+		adapter.setStatus("w1:p1", "idle");
+		const pane = adapter.getPane("w1:p1");
+		if (!pane) throw new Error("expected pane");
+		pane.onRun = () => {
+			// Hold the follow-up before its working transition.
+		};
+		const steerPromise = steerAgent(deps, {
+			agentId: launched.agentId,
+			message: "second write",
+		});
+		await vi.waitFor(() => expect(store.get(launched.agentId)?.recordStatus).toBe("starting"));
+		await expect(
+			launchAgent(
+				deps,
+				{ cwd },
+				{
+					role: "executor",
+					profile: "pi",
+					prompt: "conflicting write",
+				},
+			),
+		).rejects.toThrow(/conflicts with active agent/);
+		adapter.setStatus("w1:p1", "working");
+		const steered = await steerPromise;
+		expect(steered.seenWorking).toBe(true);
+	});
+
 	it("passes the startup timeout through to agent start", async () => {
 		const deps = makeDeps(adapter, store);
 		const launchPromise = launchAgent(
@@ -372,7 +599,7 @@ describe("lifecycle", () => {
 		const launchPromise = launchAgent(
 			deps,
 			{ cwd },
-			{ profile: "pi", prompt, mode: "background", startupTimeoutMs: 5000 },
+			{ role: "scout", profile: "pi", prompt, mode: "background", startupTimeoutMs: 5000 },
 			undefined,
 			{ sleep: noSleep, pollIntervalMs: 1 },
 		);
@@ -428,6 +655,28 @@ describe("lifecycle", () => {
 		expect(adapter.calls.some((c) => c.method === "paneMove")).toBe(false);
 		const start = adapter.calls.find((c) => c.method === "agentStart");
 		expect(start?.args[0]).toMatchObject({ split: "down" });
+	});
+
+	it("bypasses auto-layout for an explicit cross-tab launch", async () => {
+		const deps = makeDeps(adapter, store);
+		const launchPromise = launchAgent(
+			deps,
+			{ cwd },
+			{
+				role: "scout",
+				profile: "pi",
+				prompt: "cross tab",
+				mode: "background",
+				tab: "w1:t2",
+			},
+			undefined,
+			{ sleep: noSleep, pollIntervalMs: 1 },
+		);
+		await vi.waitFor(() => adapter.getPane("w1:p1"));
+		adapter.setStatus("w1:p1", "idle");
+		const result = await launchPromise;
+		expect(store.get(result.agentId)?.layoutSlot).toBeUndefined();
+		expect(adapter.calls.some((call) => call.method === "paneMove")).toBe(false);
 	});
 
 	it("bypasses auto-layout for workspace-targeted launches", async () => {
@@ -527,21 +776,39 @@ describe("lifecycle", () => {
 			launchAgent(
 				deps,
 				{ cwd },
-				{ profile: "pi", prompt: "concurrent a", mode: "background", startupTimeoutMs: 5000 },
+				{
+					role: "scout",
+					profile: "pi",
+					prompt: "concurrent a",
+					mode: "background",
+					startupTimeoutMs: 5000,
+				},
 				undefined,
 				{ sleep: noSleep, pollIntervalMs: 1 },
 			),
 			launchAgent(
 				deps,
 				{ cwd },
-				{ profile: "pi", prompt: "concurrent b", mode: "background", startupTimeoutMs: 5000 },
+				{
+					role: "scout",
+					profile: "pi",
+					prompt: "concurrent b",
+					mode: "background",
+					startupTimeoutMs: 5000,
+				},
 				undefined,
 				{ sleep: noSleep, pollIntervalMs: 1 },
 			),
 			launchAgent(
 				deps,
 				{ cwd },
-				{ profile: "pi", prompt: "concurrent c", mode: "background", startupTimeoutMs: 5000 },
+				{
+					role: "scout",
+					profile: "pi",
+					prompt: "concurrent c",
+					mode: "background",
+					startupTimeoutMs: 5000,
+				},
 				undefined,
 				{ sleep: noSleep, pollIntervalMs: 1 },
 			),
@@ -564,6 +831,57 @@ describe("lifecycle", () => {
 		const slots = results.map((r) => store.get(r.agentId)?.layoutSlot);
 		expect(new Set(slots)).toEqual(new Set([1, 2, 3]));
 		expect(slots.every((slot) => slot !== undefined)).toBe(true);
+	});
+
+	it("reconciles a pane created before agent start reports failure", async () => {
+		const deps = makeDeps(adapter, store);
+		const realStart = adapter.agentStart.bind(adapter);
+		adapter.agentStart = async (options) => {
+			await realStart(options);
+			throw new Error("malformed start response");
+		};
+		const result = await launchAgent(
+			deps,
+			{ cwd },
+			{
+				role: "scout",
+				profile: "pi",
+				prompt: "recover me",
+				mode: "background",
+			},
+		);
+		expect(result.partial).toBe(true);
+		expect(result.status).toBe("error");
+		expect(store.get(result.agentId)?.identity.paneId).toBe("w1:p1");
+		expect(adapter.calls.some((call) => call.method === "agentGet")).toBe(true);
+	});
+
+	it("does not persist unchanged result polls", async () => {
+		let snapshots = 0;
+		store.setAppendEntry(() => {
+			snapshots += 1;
+		});
+		const deps = makeDeps(adapter, store);
+		const launchPromise = launchAgent(
+			deps,
+			{ cwd },
+			{
+				role: "scout",
+				profile: "pi",
+				prompt: "stable",
+				mode: "background",
+				startupTimeoutMs: 5000,
+			},
+			undefined,
+			{ sleep: noSleep, pollIntervalMs: 1 },
+		);
+		await vi.waitFor(() => adapter.getPane("w1:p1"));
+		adapter.setStatus("w1:p1", "idle");
+		const launched = await launchPromise;
+		const afterLaunch = snapshots;
+		await getAgentResult(deps, { agentId: launched.agentId, mode: "poll" });
+		await getAgentResult(deps, { agentId: launched.agentId, mode: "poll" });
+		expect(snapshots).toBe(afterLaunch);
 	});
 
 	it("stop validates ownership and closes pane", async () => {
